@@ -19,24 +19,25 @@ cargo run -- --help
 
 ## Login
 
-For Gmail, create a Google OAuth client and allow
-`http://127.0.0.1:8765/callback` as a redirect URI. Then login with the Gmail
-address. The CLI detects the domain, opens a browser, receives the OAuth
-callback, reads the Gmail profile, and saves the account automatically:
+For Gmail, login with the Gmail address. The CLI detects the domain, opens a
+browser, receives the OAuth callback, reads the Gmail profile, and saves the
+account automatically:
 
 ```sh
-email auth login "$GMAIL_ADDRESS" \
-  --client-id "$GMAIL_CLIENT_ID" \
-  --client-secret "$GMAIL_CLIENT_SECRET"
+email auth login "$GMAIL_ADDRESS"
 ```
 
-The client id and secret can also be supplied through environment variables:
+The first Gmail login needs a Google OAuth client. If one is not already saved,
+the CLI prompts for the client id and secret, then stores them in the config for
+future logins. You can also prefill them with environment variables:
 
 ```sh
 export GMAIL_CLIENT_ID=...
 export GMAIL_CLIENT_SECRET=...
 email auth login "$GMAIL_ADDRESS"
 ```
+
+Use `http://127.0.0.1:8765/callback` as the local callback redirect URI.
 
 For common non-Gmail domains, the CLI selects an IMAP/SMTP preset from the
 email domain and prompts for the password:

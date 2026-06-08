@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -148,7 +148,15 @@ struct AccountArg {
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Config {
     active_account: Option<String>,
+    #[serde(default)]
+    gmail_oauth: Option<GmailOAuthConfig>,
     accounts: BTreeMap<String, AccountConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GmailOAuthConfig {
+    client_id: String,
+    client_secret: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -331,20 +339,16 @@ fn provider_for_email(email: &str) -> Result<LoginProvider> {
 }
 
 fn login_gmail(args: LoginArgs) -> Result<()> {
-    let client_id = args
-        .client_id
-        .as_deref()
-        .context("Gmail login requires --client-id or GMAIL_CLIENT_ID")?;
-    let client_secret = args
-        .client_secret
-        .as_deref()
-        .context("Gmail login requires --client-secret or GMAIL_CLIENT_SECRET")?;
+    let mut config = load_config()?;
+    let oauth = resolve_gmail_oauth(&args, &mut config)?;
+    save_config(&config)?;
+
     let redirect_uri = format!("http://127.0.0.1:{}/callback", args.port);
     let state = oauth_state();
     let mut auth_url = Url::parse(GMAIL_AUTH_URL)?;
     auth_url
         .query_pairs_mut()
-        .append_pair("client_id", client_id)
+        .append_pair("client_id", &oauth.client_id)
         .append_pair("redirect_uri", &redirect_uri)
         .append_pair("response_type", "code")
         .append_pair("scope", GMAIL_SCOPES)
@@ -352,21 +356,22 @@ fn login_gmail(args: LoginArgs) -> Result<()> {
         .append_pair("prompt", "consent")
         .append_pair("state", &state);
 
+    let server = Server::http(("127.0.0.1", args.port))
+        .map_err(|err| anyhow!("failed to bind OAuth callback on port {}: {err}", args.port))?;
+
     println!("Open this URL to login:\n{auth_url}\n");
     if !args.no_browser {
         let _ = webbrowser::open(auth_url.as_str());
     }
 
-    let server = Server::http(("127.0.0.1", args.port))
-        .map_err(|err| anyhow!("failed to bind OAuth callback on port {}: {err}", args.port))?;
     let code = wait_for_oauth_code(&server, &state)?;
 
     let client = Client::new();
     let token = client
         .post(GMAIL_TOKEN_URL)
         .form(&[
-            ("client_id", client_id),
-            ("client_secret", client_secret),
+            ("client_id", oauth.client_id.as_str()),
+            ("client_secret", oauth.client_secret.as_str()),
             ("code", code.as_str()),
             ("redirect_uri", redirect_uri.as_str()),
             ("grant_type", "authorization_code"),
@@ -391,13 +396,12 @@ fn login_gmail(args: LoginArgs) -> Result<()> {
     )?;
     let expires_at = now_ts() + token.expires_in.unwrap_or(3600) - 60;
 
-    let mut config = load_config()?;
     config.accounts.insert(
         email.clone(),
         AccountConfig::Gmail(GmailAccount {
             email: email.clone(),
-            client_id: client_id.to_string(),
-            client_secret: client_secret.to_string(),
+            client_id: oauth.client_id,
+            client_secret: oauth.client_secret,
             access_token: token.access_token,
             refresh_token,
             expires_at,
@@ -407,6 +411,63 @@ fn login_gmail(args: LoginArgs) -> Result<()> {
     save_config(&config)?;
     println!("Logged in Gmail account: {email}");
     Ok(())
+}
+
+fn resolve_gmail_oauth(args: &LoginArgs, config: &mut Config) -> Result<GmailOAuthConfig> {
+    let mut client_id = args.client_id.clone().or_else(|| {
+        config
+            .gmail_oauth
+            .as_ref()
+            .map(|oauth| oauth.client_id.clone())
+    });
+    let mut client_secret = args.client_secret.clone().or_else(|| {
+        config
+            .gmail_oauth
+            .as_ref()
+            .map(|oauth| oauth.client_secret.clone())
+    });
+
+    if client_id.is_none() || client_secret.is_none() {
+        println!("Gmail needs a Google OAuth client the first time.");
+        println!(
+            "Create one in Google Cloud Console as a Desktop app, then add this redirect URI:"
+        );
+        println!("http://127.0.0.1:{}/callback\n", args.port);
+
+        if client_id.is_none() {
+            client_id = Some(prompt_nonempty("Gmail OAuth Client ID: ")?);
+        }
+        if client_secret.is_none() {
+            client_secret = Some(rpassword::prompt_password("Gmail OAuth Client Secret: ")?);
+            if client_secret
+                .as_deref()
+                .unwrap_or_default()
+                .trim()
+                .is_empty()
+            {
+                bail!("Gmail OAuth Client Secret cannot be empty");
+            }
+        }
+    }
+
+    let oauth = GmailOAuthConfig {
+        client_id: client_id.context("Gmail OAuth Client ID is required")?,
+        client_secret: client_secret.context("Gmail OAuth Client Secret is required")?,
+    };
+    config.gmail_oauth = Some(oauth.clone());
+    Ok(oauth)
+}
+
+fn prompt_nonempty(prompt: &str) -> Result<String> {
+    print!("{prompt}");
+    io::stdout().flush()?;
+    let mut value = String::new();
+    io::stdin().read_line(&mut value)?;
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        bail!("{prompt} cannot be empty");
+    }
+    Ok(value)
 }
 
 fn wait_for_oauth_code(server: &Server, expected_state: &str) -> Result<String> {
@@ -1025,4 +1086,45 @@ fn now_ts() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gmail_domains_use_browser_oauth() {
+        assert!(matches!(
+            provider_for_email(&format!("user{}gmail.com", '@')).unwrap(),
+            LoginProvider::Gmail
+        ));
+        assert!(matches!(
+            provider_for_email(&format!("user{}googlemail.com", '@')).unwrap(),
+            LoginProvider::Gmail
+        ));
+    }
+
+    #[test]
+    fn common_domains_use_presets() {
+        let LoginProvider::Generic(Some(preset)) =
+            provider_for_email(&format!("user{}outlook.com", '@')).unwrap()
+        else {
+            panic!("outlook should use a preset");
+        };
+        assert_eq!(preset.imap_host, "outlook.office365.com");
+        assert_eq!(preset.smtp_host, "smtp.office365.com");
+    }
+
+    #[test]
+    fn custom_domains_need_manual_servers() {
+        assert!(matches!(
+            provider_for_email(&format!("user{}example.invalid", '@')).unwrap(),
+            LoginProvider::Generic(None)
+        ));
+    }
+
+    #[test]
+    fn invalid_email_is_rejected() {
+        assert!(provider_for_email("not-an-email").is_err());
+    }
 }

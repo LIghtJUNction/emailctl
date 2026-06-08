@@ -15,6 +15,7 @@ use lettre::{Message, SmtpTransport, Transport};
 use mailparse::MailHeaderMap;
 use native_tls::TlsConnector;
 use reqwest::blocking::Client;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tiny_http::{Response, Server};
@@ -367,21 +368,20 @@ fn login_gmail(args: LoginArgs) -> Result<()> {
     let code = wait_for_oauth_code(&server, &state)?;
 
     let client = Client::new();
-    let token = client
-        .post(GMAIL_TOKEN_URL)
-        .form(&[
-            ("client_id", oauth.client_id.as_str()),
-            ("client_secret", oauth.client_secret.as_str()),
-            ("code", code.as_str()),
-            ("redirect_uri", redirect_uri.as_str()),
-            ("grant_type", "authorization_code"),
-        ])
-        .send()
-        .context("failed to exchange OAuth code")?
-        .error_for_status()
-        .context("Google rejected the OAuth code")?
-        .json::<TokenResponse>()
-        .context("failed to decode Google token response")?;
+    let token = google_json::<TokenResponse>(
+        client
+            .post(GMAIL_TOKEN_URL)
+            .form(&[
+                ("client_id", oauth.client_id.as_str()),
+                ("client_secret", oauth.client_secret.as_str()),
+                ("code", code.as_str()),
+                ("redirect_uri", redirect_uri.as_str()),
+                ("grant_type", "authorization_code"),
+            ])
+            .send()
+            .context("failed to exchange OAuth code")?,
+        "Google OAuth token exchange",
+    )?;
 
     let profile_email = gmail_profile_email(&client, &token.access_token)?;
     if !args.email.eq_ignore_ascii_case(&profile_email) {
@@ -658,13 +658,10 @@ fn list_gmail(account: &mut GmailAccount, limit: usize, query: Option<String>) -
         request = request.query(&[("q", query)]);
     }
 
-    let list = request
-        .send()
-        .context("failed to list Gmail messages")?
-        .error_for_status()
-        .context("Gmail list request failed")?
-        .json::<GmailListResponse>()
-        .context("failed to decode Gmail list response")?;
+    let list = google_json::<GmailListResponse>(
+        request.send().context("failed to list Gmail messages")?,
+        "Gmail list request",
+    )?;
 
     let Some(messages) = list.messages else {
         println!("No messages.");
@@ -690,16 +687,15 @@ fn list_gmail(account: &mut GmailAccount, limit: usize, query: Option<String>) -
 fn read_gmail(account: &mut GmailAccount, id: &str) -> Result<()> {
     let token = gmail_access_token(account)?;
     let client = Client::new();
-    let message = client
-        .get(format!("{GMAIL_API_ROOT}/messages/{id}"))
-        .bearer_auth(&token)
-        .query(&[("format", "full")])
-        .send()
-        .context("failed to read Gmail message")?
-        .error_for_status()
-        .context("Gmail read request failed")?
-        .json::<GmailMessage>()
-        .context("failed to decode Gmail message")?;
+    let message = google_json::<GmailMessage>(
+        client
+            .get(format!("{GMAIL_API_ROOT}/messages/{id}"))
+            .bearer_auth(&token)
+            .query(&[("format", "full")])
+            .send()
+            .context("failed to read Gmail message")?,
+        "Gmail read request",
+    )?;
 
     let headers = gmail_headers(message.payload.as_ref());
     print_header("From", header_value(&headers, "From"));
@@ -721,16 +717,15 @@ fn send_gmail(account: &mut GmailAccount, to: &str, subject: &str, body: &str) -
         account.email
     );
     let raw = URL_SAFE_NO_PAD.encode(raw_message.as_bytes());
-    let response: serde_json::Value = Client::new()
-        .post(format!("{GMAIL_API_ROOT}/messages/send"))
-        .bearer_auth(&token)
-        .json(&json!({ "raw": raw }))
-        .send()
-        .context("failed to send Gmail message")?
-        .error_for_status()
-        .context("Gmail send request failed")?
-        .json()
-        .context("failed to decode Gmail send response")?;
+    let response = google_json::<serde_json::Value>(
+        Client::new()
+            .post(format!("{GMAIL_API_ROOT}/messages/send"))
+            .bearer_auth(&token)
+            .json(&json!({ "raw": raw }))
+            .send()
+            .context("failed to send Gmail message")?,
+        "Gmail send request",
+    )?;
 
     println!(
         "Sent Gmail message: {}",
@@ -743,34 +738,109 @@ fn send_gmail(account: &mut GmailAccount, to: &str, subject: &str, body: &str) -
 }
 
 fn gmail_message_metadata(client: &Client, token: &str, id: &str) -> Result<GmailMessage> {
-    client
-        .get(format!("{GMAIL_API_ROOT}/messages/{id}"))
-        .bearer_auth(token)
-        .query(&[
-            ("format", "metadata"),
-            ("metadataHeaders", "Subject"),
-            ("metadataHeaders", "From"),
-            ("metadataHeaders", "Date"),
-        ])
-        .send()
-        .context("failed to read Gmail metadata")?
-        .error_for_status()
-        .context("Gmail metadata request failed")?
-        .json::<GmailMessage>()
-        .context("failed to decode Gmail metadata")
+    google_json::<GmailMessage>(
+        client
+            .get(format!("{GMAIL_API_ROOT}/messages/{id}"))
+            .bearer_auth(token)
+            .query(&[
+                ("format", "metadata"),
+                ("metadataHeaders", "Subject"),
+                ("metadataHeaders", "From"),
+                ("metadataHeaders", "Date"),
+            ])
+            .send()
+            .context("failed to read Gmail metadata")?,
+        "Gmail metadata request",
+    )
 }
 
 fn gmail_profile_email(client: &Client, token: &str) -> Result<String> {
-    let profile = client
-        .get(format!("{GMAIL_API_ROOT}/profile"))
-        .bearer_auth(token)
-        .send()
-        .context("failed to read Gmail profile")?
-        .error_for_status()
-        .context("Gmail profile request failed")?
-        .json::<GmailProfile>()
-        .context("failed to decode Gmail profile")?;
+    let profile = google_json::<GmailProfile>(
+        client
+            .get(format!("{GMAIL_API_ROOT}/profile"))
+            .bearer_auth(token)
+            .send()
+            .context("failed to read Gmail profile")?,
+        "Gmail profile request",
+    )?;
     Ok(profile.email_address)
+}
+
+fn google_json<T: DeserializeOwned>(
+    response: reqwest::blocking::Response,
+    label: &str,
+) -> Result<T> {
+    let status = response.status();
+    let url = response.url().clone();
+    let body = response
+        .text()
+        .with_context(|| format!("failed to read {label} response body"))?;
+
+    if !status.is_success() {
+        bail!(
+            "{label} failed: {status} for {url}\n{}",
+            format_google_error(&body)
+        );
+    }
+
+    serde_json::from_str(&body).with_context(|| format!("failed to decode {label} response"))
+}
+
+fn format_google_error(body: &str) -> String {
+    let trimmed = body.trim();
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return format!("Response body: {}", truncate(trimmed, 1200));
+    };
+
+    let error = value.get("error").unwrap_or(&value);
+    let mut lines = Vec::new();
+    if let Some(message) = error.get("message").and_then(|value| value.as_str()) {
+        lines.push(format!("Google message: {message}"));
+    }
+    if let Some(status) = error.get("status").and_then(|value| value.as_str()) {
+        lines.push(format!("Google status: {status}"));
+    }
+    if let Some(reason) = error
+        .get("errors")
+        .and_then(|value| value.as_array())
+        .and_then(|errors| errors.first())
+        .and_then(|error| error.get("reason"))
+        .and_then(|value| value.as_str())
+    {
+        lines.push(format!("Google reason: {reason}"));
+    }
+
+    let details = lines.join("\n");
+    let lower = details.to_ascii_lowercase();
+    if lower.contains("api has not been used")
+        || lower.contains("disabled")
+        || lower.contains("accessnotconfigured")
+        || lower.contains("service_disabled")
+    {
+        lines.push(
+            "Hint: enable Gmail API for the same Google Cloud project as this OAuth client, then wait a minute and retry."
+                .to_string(),
+        );
+    } else if lower.contains("insufficient")
+        || lower.contains("permission")
+        || lower.contains("scope")
+    {
+        lines.push(
+            "Hint: re-run login and consent to Gmail read/send scopes; revoke the old grant if Google skips the consent screen."
+                .to_string(),
+        );
+    } else if lower.contains("forbidden") || lower.contains("gmail") {
+        lines.push(
+            "Hint: check that the signed-in Google account has Gmail enabled and is allowed on the OAuth consent screen if the app is in Testing."
+                .to_string(),
+        );
+    }
+
+    if lines.is_empty() {
+        format!("Response body: {}", truncate(trimmed, 1200))
+    } else {
+        lines.join("\n")
+    }
 }
 
 fn gmail_access_token(account: &mut GmailAccount) -> Result<String> {
@@ -778,20 +848,19 @@ fn gmail_access_token(account: &mut GmailAccount) -> Result<String> {
         return Ok(account.access_token.clone());
     }
 
-    let token = Client::new()
-        .post(GMAIL_TOKEN_URL)
-        .form(&[
-            ("client_id", account.client_id.as_str()),
-            ("client_secret", account.client_secret.as_str()),
-            ("refresh_token", account.refresh_token.as_str()),
-            ("grant_type", "refresh_token"),
-        ])
-        .send()
-        .context("failed to refresh Gmail access token")?
-        .error_for_status()
-        .context("Google rejected the refresh token")?
-        .json::<TokenResponse>()
-        .context("failed to decode refreshed Gmail token")?;
+    let token = google_json::<TokenResponse>(
+        Client::new()
+            .post(GMAIL_TOKEN_URL)
+            .form(&[
+                ("client_id", account.client_id.as_str()),
+                ("client_secret", account.client_secret.as_str()),
+                ("refresh_token", account.refresh_token.as_str()),
+                ("grant_type", "refresh_token"),
+            ])
+            .send()
+            .context("failed to refresh Gmail access token")?,
+        "Gmail token refresh",
+    )?;
 
     account.access_token = token.access_token.clone();
     account.expires_at = now_ts() + token.expires_in.unwrap_or(3600) - 60;
@@ -1129,5 +1198,25 @@ mod tests {
     #[test]
     fn invalid_email_is_rejected() {
         assert!(provider_for_email("not-an-email").is_err());
+    }
+
+    #[test]
+    fn google_errors_show_reason_and_hint() {
+        let error = format_google_error(
+            r#"{
+              "error": {
+                "code": 403,
+                "message": "Gmail API has not been used in project 123 before or it is disabled.",
+                "status": "PERMISSION_DENIED",
+                "errors": [
+                  { "reason": "accessNotConfigured" }
+                ]
+              }
+            }"#,
+        );
+
+        assert!(error.contains("Gmail API has not been used"));
+        assert!(error.contains("accessNotConfigured"));
+        assert!(error.contains("enable Gmail API"));
     }
 }

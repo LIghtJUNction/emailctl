@@ -429,10 +429,13 @@ fn resolve_gmail_oauth(args: &LoginArgs, config: &mut Config) -> Result<GmailOAu
 
     if client_id.is_none() || client_secret.is_none() {
         println!("Gmail needs a Google OAuth client the first time.");
-        println!(
-            "Create one in Google Cloud Console as a Desktop app, then add this redirect URI:"
-        );
-        println!("http://127.0.0.1:{}/callback\n", args.port);
+        println!("1. Enable the Gmail API:");
+        println!("   https://console.cloud.google.com/apis/library/gmail.googleapis.com");
+        println!("2. Create an OAuth client:");
+        println!("   https://console.cloud.google.com/apis/credentials");
+        println!("3. Choose type: Web application");
+        println!("4. Add this Authorized redirect URI:");
+        println!("   http://127.0.0.1:{}/callback\n", args.port);
 
         if client_id.is_none() {
             client_id = Some(prompt_nonempty("Gmail OAuth Client ID: ")?);

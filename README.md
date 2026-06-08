@@ -31,13 +31,18 @@ The first Gmail login needs a Google OAuth client. If one is not already saved,
 the CLI prompts for the client id and secret, then stores them in the config for
 future logins. You can also prefill them with environment variables:
 
+1. Enable the Gmail API:
+   `https://console.cloud.google.com/apis/library/gmail.googleapis.com`
+2. Create an OAuth client:
+   `https://console.cloud.google.com/apis/credentials`
+3. Choose `Web application`.
+4. Add `http://127.0.0.1:8765/callback` as an authorized redirect URI.
+
 ```sh
 export GMAIL_CLIENT_ID=...
 export GMAIL_CLIENT_SECRET=...
 email auth login "$GMAIL_ADDRESS"
 ```
-
-Use `http://127.0.0.1:8765/callback` as the local callback redirect URI.
 
 For common non-Gmail domains, the CLI selects an IMAP/SMTP preset from the
 email domain and prompts for the password:

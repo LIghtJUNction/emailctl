@@ -57,67 +57,48 @@ enum Command {
 
 #[derive(Subcommand, Debug)]
 enum AuthCommand {
-    /// Login to an account.
-    Login {
-        #[command(subcommand)]
-        command: LoginCommand,
-    },
+    /// Login to an account by email address.
+    Login(LoginArgs),
     /// Show the active account.
     Whoami,
     /// Remove an account.
     Logout(AccountArg),
 }
 
-#[derive(Subcommand, Debug)]
-enum LoginCommand {
-    /// Gmail OAuth login through a browser callback.
-    Gmail(GmailLoginArgs),
-    /// Generic IMAP/SMTP login with username and password.
-    Generic(GenericLoginArgs),
-}
-
 #[derive(Args, Debug)]
-struct GmailLoginArgs {
-    /// Gmail address to save as the account id.
-    #[arg(long)]
+struct LoginArgs {
+    /// Email address. The domain selects Gmail OAuth or an IMAP/SMTP provider preset.
     email: String,
-    /// Google OAuth desktop/web client id.
+    /// Google OAuth desktop/web client id. Used for Gmail accounts.
     #[arg(long, env = "GMAIL_CLIENT_ID")]
-    client_id: String,
-    /// Google OAuth client secret.
+    client_id: Option<String>,
+    /// Google OAuth client secret. Used for Gmail accounts.
     #[arg(long, env = "GMAIL_CLIENT_SECRET")]
-    client_secret: String,
-    /// Local callback port used during OAuth.
+    client_secret: Option<String>,
+    /// Local callback port used during Gmail OAuth.
     #[arg(long, default_value_t = 8765)]
     port: u16,
-    /// Print the login URL instead of opening a browser.
+    /// Print the Gmail login URL instead of opening a browser.
     #[arg(long)]
     no_browser: bool,
-}
-
-#[derive(Args, Debug)]
-struct GenericLoginArgs {
-    /// Email address to save as the account id.
-    #[arg(long)]
-    email: String,
     /// Login username. Defaults to --email.
     #[arg(long)]
     username: Option<String>,
     /// Login password. If omitted, the CLI prompts securely.
     #[arg(long)]
     password: Option<String>,
-    /// IMAP host, for example imap.example.com.
+    /// Override or provide IMAP host, for example imap.example.com.
     #[arg(long)]
-    imap_host: String,
-    /// IMAP TLS port.
-    #[arg(long, default_value_t = 993)]
-    imap_port: u16,
-    /// SMTP host, for example smtp.example.com.
+    imap_host: Option<String>,
+    /// Override or provide IMAP TLS port.
     #[arg(long)]
-    smtp_host: String,
-    /// SMTP STARTTLS port.
-    #[arg(long, default_value_t = 587)]
-    smtp_port: u16,
+    imap_port: Option<u16>,
+    /// Override or provide SMTP host, for example smtp.example.com.
+    #[arg(long)]
+    smtp_host: Option<String>,
+    /// Override or provide SMTP STARTTLS port.
+    #[arg(long)]
+    smtp_port: Option<u16>,
 }
 
 #[derive(Args, Debug)]
@@ -198,11 +179,31 @@ struct GenericAccount {
     smtp_port: u16,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ProviderPreset {
+    imap_host: &'static str,
+    imap_port: u16,
+    smtp_host: &'static str,
+    smtp_port: u16,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LoginProvider {
+    Gmail,
+    Generic(Option<ProviderPreset>),
+}
+
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
     access_token: String,
     refresh_token: Option<String>,
     expires_in: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GmailProfile {
+    #[serde(rename = "emailAddress")]
+    email_address: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -255,17 +256,12 @@ fn main() -> Result<()> {
 
 fn handle_auth(command: AuthCommand) -> Result<()> {
     match command {
-        AuthCommand::Login { command } => match command {
-            LoginCommand::Gmail(args) => login_gmail(args),
-            LoginCommand::Generic(args) => login_generic(args),
-        },
+        AuthCommand::Login(args) => login_account(args),
         AuthCommand::Whoami => {
             let config = load_config()?;
             match config.active_account {
                 Some(account) => println!("{account}"),
-                None => bail!(
-                    "no active account; run `email auth login gmail` or `email auth login generic`"
-                ),
+                None => bail!("no active account; run `email auth login <email>`"),
             }
             Ok(())
         }
@@ -273,13 +269,82 @@ fn handle_auth(command: AuthCommand) -> Result<()> {
     }
 }
 
-fn login_gmail(args: GmailLoginArgs) -> Result<()> {
+fn login_account(args: LoginArgs) -> Result<()> {
+    match provider_for_email(&args.email)? {
+        LoginProvider::Gmail => login_gmail(args),
+        LoginProvider::Generic(preset) => login_generic(args, preset),
+    }
+}
+
+fn provider_for_email(email: &str) -> Result<LoginProvider> {
+    let domain = email
+        .split_once('@')
+        .map(|(_, domain)| domain.to_ascii_lowercase())
+        .filter(|domain| !domain.is_empty())
+        .with_context(|| format!("invalid email address: {email}"))?;
+
+    let provider = match domain.as_str() {
+        "gmail.com" | "googlemail.com" => LoginProvider::Gmail,
+        "outlook.com" | "hotmail.com" | "live.com" | "msn.com" => {
+            LoginProvider::Generic(Some(ProviderPreset {
+                imap_host: "outlook.office365.com",
+                imap_port: 993,
+                smtp_host: "smtp.office365.com",
+                smtp_port: 587,
+            }))
+        }
+        "yahoo.com" | "ymail.com" | "rocketmail.com" => {
+            LoginProvider::Generic(Some(ProviderPreset {
+                imap_host: "imap.mail.yahoo.com",
+                imap_port: 993,
+                smtp_host: "smtp.mail.yahoo.com",
+                smtp_port: 587,
+            }))
+        }
+        "icloud.com" | "me.com" | "mac.com" => LoginProvider::Generic(Some(ProviderPreset {
+            imap_host: "imap.mail.me.com",
+            imap_port: 993,
+            smtp_host: "smtp.mail.me.com",
+            smtp_port: 587,
+        })),
+        "qq.com" => LoginProvider::Generic(Some(ProviderPreset {
+            imap_host: "imap.qq.com",
+            imap_port: 993,
+            smtp_host: "smtp.qq.com",
+            smtp_port: 587,
+        })),
+        "163.com" => LoginProvider::Generic(Some(ProviderPreset {
+            imap_host: "imap.163.com",
+            imap_port: 993,
+            smtp_host: "smtp.163.com",
+            smtp_port: 587,
+        })),
+        "126.com" => LoginProvider::Generic(Some(ProviderPreset {
+            imap_host: "imap.126.com",
+            imap_port: 993,
+            smtp_host: "smtp.126.com",
+            smtp_port: 587,
+        })),
+        _ => LoginProvider::Generic(None),
+    };
+    Ok(provider)
+}
+
+fn login_gmail(args: LoginArgs) -> Result<()> {
+    let client_id = args
+        .client_id
+        .as_deref()
+        .context("Gmail login requires --client-id or GMAIL_CLIENT_ID")?;
+    let client_secret = args
+        .client_secret
+        .as_deref()
+        .context("Gmail login requires --client-secret or GMAIL_CLIENT_SECRET")?;
     let redirect_uri = format!("http://127.0.0.1:{}/callback", args.port);
     let state = oauth_state();
     let mut auth_url = Url::parse(GMAIL_AUTH_URL)?;
     auth_url
         .query_pairs_mut()
-        .append_pair("client_id", &args.client_id)
+        .append_pair("client_id", client_id)
         .append_pair("redirect_uri", &redirect_uri)
         .append_pair("response_type", "code")
         .append_pair("scope", GMAIL_SCOPES)
@@ -296,11 +361,12 @@ fn login_gmail(args: GmailLoginArgs) -> Result<()> {
         .map_err(|err| anyhow!("failed to bind OAuth callback on port {}: {err}", args.port))?;
     let code = wait_for_oauth_code(&server, &state)?;
 
-    let token = Client::new()
+    let client = Client::new();
+    let token = client
         .post(GMAIL_TOKEN_URL)
         .form(&[
-            ("client_id", args.client_id.as_str()),
-            ("client_secret", args.client_secret.as_str()),
+            ("client_id", client_id),
+            ("client_secret", client_secret),
             ("code", code.as_str()),
             ("redirect_uri", redirect_uri.as_str()),
             ("grant_type", "authorization_code"),
@@ -312,6 +378,14 @@ fn login_gmail(args: GmailLoginArgs) -> Result<()> {
         .json::<TokenResponse>()
         .context("failed to decode Google token response")?;
 
+    let profile_email = gmail_profile_email(&client, &token.access_token)?;
+    if !args.email.eq_ignore_ascii_case(&profile_email) {
+        bail!(
+            "browser logged in as {profile_email}, but the command requested {}; choose the matching Google account",
+            args.email
+        );
+    }
+    let email = profile_email;
     let refresh_token = token.refresh_token.context(
         "Google did not return a refresh token; retry with a fresh consent prompt or revoke the app first",
     )?;
@@ -319,19 +393,19 @@ fn login_gmail(args: GmailLoginArgs) -> Result<()> {
 
     let mut config = load_config()?;
     config.accounts.insert(
-        args.email.clone(),
+        email.clone(),
         AccountConfig::Gmail(GmailAccount {
-            email: args.email.clone(),
-            client_id: args.client_id,
-            client_secret: args.client_secret,
+            email: email.clone(),
+            client_id: client_id.to_string(),
+            client_secret: client_secret.to_string(),
             access_token: token.access_token,
             refresh_token,
             expires_at,
         }),
     );
-    config.active_account = Some(args.email.clone());
+    config.active_account = Some(email.clone());
     save_config(&config)?;
-    println!("Logged in Gmail account: {}", args.email);
+    println!("Logged in Gmail account: {email}");
     Ok(())
 }
 
@@ -372,21 +446,38 @@ fn wait_for_oauth_code(server: &Server, expected_state: &str) -> Result<String> 
     code.context("OAuth callback did not include a code")
 }
 
-fn login_generic(args: GenericLoginArgs) -> Result<()> {
+fn login_generic(args: LoginArgs, preset: Option<ProviderPreset>) -> Result<()> {
     let username = args.username.unwrap_or_else(|| args.email.clone());
     let password = match args.password {
         Some(password) => password,
         None => rpassword::prompt_password("Password: ")?,
     };
 
+    let imap_host = args
+        .imap_host
+        .or_else(|| preset.map(|preset| preset.imap_host.to_string()))
+        .context("unknown email provider; pass --imap-host and --smtp-host")?;
+    let smtp_host = args
+        .smtp_host
+        .or_else(|| preset.map(|preset| preset.smtp_host.to_string()))
+        .context("unknown email provider; pass --imap-host and --smtp-host")?;
+    let imap_port = args
+        .imap_port
+        .or_else(|| preset.map(|preset| preset.imap_port))
+        .unwrap_or(993);
+    let smtp_port = args
+        .smtp_port
+        .or_else(|| preset.map(|preset| preset.smtp_port))
+        .unwrap_or(587);
+
     let account = GenericAccount {
         email: args.email.clone(),
         username,
         password,
-        imap_host: args.imap_host,
-        imap_port: args.imap_port,
-        smtp_host: args.smtp_host,
-        smtp_port: args.smtp_port,
+        imap_host,
+        imap_port,
+        smtp_host,
+        smtp_port,
     };
     test_generic_login(&account)?;
 
@@ -603,6 +694,19 @@ fn gmail_message_metadata(client: &Client, token: &str, id: &str) -> Result<Gmai
         .context("Gmail metadata request failed")?
         .json::<GmailMessage>()
         .context("failed to decode Gmail metadata")
+}
+
+fn gmail_profile_email(client: &Client, token: &str) -> Result<String> {
+    let profile = client
+        .get(format!("{GMAIL_API_ROOT}/profile"))
+        .bearer_auth(token)
+        .send()
+        .context("failed to read Gmail profile")?
+        .error_for_status()
+        .context("Gmail profile request failed")?
+        .json::<GmailProfile>()
+        .context("failed to decode Gmail profile")?;
+    Ok(profile.email_address)
 }
 
 fn gmail_access_token(account: &mut GmailAccount) -> Result<String> {
@@ -885,7 +989,7 @@ fn resolve_account(config: &Config, account: Option<String>) -> Result<String> {
     match account.or_else(|| config.active_account.clone()) {
         Some(account) => Ok(account),
         None => {
-            bail!("no active account; run `email auth login gmail` or `email auth login generic`")
+            bail!("no active account; run `email auth login <email>`")
         }
     }
 }

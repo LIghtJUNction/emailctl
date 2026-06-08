@@ -60,6 +60,10 @@ enum Command {
 enum AuthCommand {
     /// Login to an account by email address.
     Login(LoginArgs),
+    /// List configured accounts.
+    List,
+    /// Make an account the default for commands.
+    Switch(AccountArg),
     /// Show the active account.
     Whoami,
     /// Remove an account.
@@ -266,6 +270,8 @@ fn main() -> Result<()> {
 fn handle_auth(command: AuthCommand) -> Result<()> {
     match command {
         AuthCommand::Login(args) => login_account(args),
+        AuthCommand::List => show_accounts(),
+        AuthCommand::Switch(arg) => use_account(arg),
         AuthCommand::Whoami => {
             let config = load_config()?;
             match config.active_account {
@@ -794,46 +800,44 @@ fn format_google_error(body: &str) -> String {
 
     let error = value.get("error").unwrap_or(&value);
     let mut lines = Vec::new();
-    if let Some(message) = error.get("message").and_then(|value| value.as_str()) {
-        lines.push(format!("Google message: {message}"));
-    }
-    if let Some(status) = error.get("status").and_then(|value| value.as_str()) {
-        lines.push(format!("Google status: {status}"));
-    }
-    if let Some(reason) = error
+    let message = error.get("message").and_then(|value| value.as_str());
+    let status = error.get("status").and_then(|value| value.as_str());
+    let reason = error
         .get("errors")
         .and_then(|value| value.as_array())
         .and_then(|errors| errors.first())
         .and_then(|error| error.get("reason"))
-        .and_then(|value| value.as_str())
-    {
+        .and_then(|value| value.as_str());
+
+    if let Some(message) = message {
+        lines.push(format!("Google message: {message}"));
+    }
+    if let Some(status) = status {
+        lines.push(format!("Google status: {status}"));
+    }
+    if let Some(reason) = reason {
         lines.push(format!("Google reason: {reason}"));
     }
 
-    let details = lines.join("\n");
+    let details = [message, status, reason]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("\n");
     let lower = details.to_ascii_lowercase();
     if lower.contains("api has not been used")
         || lower.contains("disabled")
         || lower.contains("accessnotconfigured")
         || lower.contains("service_disabled")
     {
-        lines.push(
-            "Hint: enable Gmail API for the same Google Cloud project as this OAuth client, then wait a minute and retry."
-                .to_string(),
-        );
+        lines.extend(gmail_api_enable_steps());
     } else if lower.contains("insufficient")
         || lower.contains("permission")
         || lower.contains("scope")
     {
-        lines.push(
-            "Hint: re-run login and consent to Gmail read/send scopes; revoke the old grant if Google skips the consent screen."
-                .to_string(),
-        );
+        lines.extend(gmail_scope_fix_steps());
     } else if lower.contains("forbidden") || lower.contains("gmail") {
-        lines.push(
-            "Hint: check that the signed-in Google account has Gmail enabled and is allowed on the OAuth consent screen if the app is in Testing."
-                .to_string(),
-        );
+        lines.extend(gmail_forbidden_fix_steps());
     }
 
     if lines.is_empty() {
@@ -841,6 +845,36 @@ fn format_google_error(body: &str) -> String {
     } else {
         lines.join("\n")
     }
+}
+
+fn gmail_api_enable_steps() -> Vec<String> {
+    vec![
+        "Fix: enable Gmail API for the same Google Cloud project as this OAuth client.".to_string(),
+        "1. Open: https://console.cloud.google.com/apis/library/gmail.googleapis.com".to_string(),
+        "2. Select the project that owns your OAuth Client ID.".to_string(),
+        "3. Click Enable, wait 1-2 minutes, then run `email auth login <gmail-address>` again."
+            .to_string(),
+    ]
+}
+
+fn gmail_scope_fix_steps() -> Vec<String> {
+    vec![
+        "Fix: refresh the Gmail OAuth grant with the required read/send scopes.".to_string(),
+        "1. Open: https://myaccount.google.com/permissions".to_string(),
+        "2. Remove this OAuth app if it is already listed.".to_string(),
+        "3. Run `email auth login <gmail-address>` again and approve Gmail read/send access."
+            .to_string(),
+        "4. If your OAuth app is in Testing, also add your Gmail as a test user: https://console.cloud.google.com/apis/credentials/consent".to_string(),
+    ]
+}
+
+fn gmail_forbidden_fix_steps() -> Vec<String> {
+    vec![
+        "Fix: check Gmail account access and OAuth consent configuration.".to_string(),
+        "1. Confirm the signed-in Google account has Gmail enabled: https://mail.google.com/".to_string(),
+        "2. If the OAuth app is in Testing, add this Gmail as a test user: https://console.cloud.google.com/apis/credentials/consent".to_string(),
+        "3. Confirm Gmail API is enabled in the same project: https://console.cloud.google.com/apis/library/gmail.googleapis.com".to_string(),
+    ]
 }
 
 fn gmail_access_token(account: &mut GmailAccount) -> Result<String> {
@@ -1201,7 +1235,7 @@ mod tests {
     }
 
     #[test]
-    fn google_errors_show_reason_and_hint() {
+    fn google_errors_show_reason_and_setup_link() {
         let error = format_google_error(
             r#"{
               "error": {
@@ -1217,6 +1251,25 @@ mod tests {
 
         assert!(error.contains("Gmail API has not been used"));
         assert!(error.contains("accessNotConfigured"));
-        assert!(error.contains("enable Gmail API"));
+        assert!(
+            error.contains("https://console.cloud.google.com/apis/library/gmail.googleapis.com")
+        );
+        assert!(error.contains("Click Enable"));
+    }
+
+    #[test]
+    fn scope_errors_show_reauth_link() {
+        let error = format_google_error(
+            r#"{
+              "error": {
+                "code": 403,
+                "message": "Request had insufficient authentication scopes.",
+                "status": "PERMISSION_DENIED"
+              }
+            }"#,
+        );
+
+        assert!(error.contains("https://myaccount.google.com/permissions"));
+        assert!(error.contains("approve Gmail read/send access"));
     }
 }

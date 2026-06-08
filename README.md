@@ -61,10 +61,27 @@ email auth login "$EMAIL_ADDRESS" \
 
 If `--password` is omitted, the CLI prompts for it securely.
 
+## Gmail Errors
+
+When Google returns an error, `email` prints the Google message plus setup links.
+Common fixes include:
+
+```text
+Enable Gmail API:
+https://console.cloud.google.com/apis/library/gmail.googleapis.com
+
+OAuth consent and test users:
+https://console.cloud.google.com/apis/credentials/consent
+
+Remove an old OAuth grant before retrying:
+https://myaccount.google.com/permissions
+```
+
 ## Usage
 
 ```sh
 email accounts
+email auth list
 email auth whoami
 email list --limit 10
 email list --query "from:github newer_than:7d"
@@ -72,6 +89,7 @@ email read MESSAGE_ID
 email send --to "$TO_ADDRESS" --subject "Hello" --body "Hi from email-cli"
 printf 'body from stdin\n' | email send --to "$TO_ADDRESS" --subject "Hello"
 email use "$EMAIL_ADDRESS"
+email auth switch "$EMAIL_ADDRESS"
 email auth logout "$EMAIL_ADDRESS"
 ```
 

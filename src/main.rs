@@ -7,8 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
-use clap::{Args, Parser, Subcommand};
-use imap::types::Fetch;
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use imap::types::{Fetch, Flag};
 use lettre::message::Mailbox;
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
@@ -23,6 +23,8 @@ use url::Url;
 
 const CONFIG_DIR: &str = "emailctl";
 const CONFIG_FILE: &str = "config.json";
+const SYNC_STATE_FILE: &str = "sync-state.json";
+const SYNC_LOCK_FILE: &str = "sync.lock";
 const GMAIL_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const GMAIL_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const GMAIL_API_ROOT: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
@@ -50,6 +52,8 @@ enum Command {
     Read(ReadArgs),
     /// Send an email.
     Send(SendArgs),
+    /// Sync message state and print changes since the previous sync.
+    Sync(SyncArgs),
     /// List configured accounts.
     Accounts,
     /// Make an account the default for commands.
@@ -114,9 +118,40 @@ struct ListArgs {
     /// Maximum number of messages.
     #[arg(short, long, default_value_t = 10)]
     limit: usize,
+    /// Filter messages by read status.
+    #[arg(long, value_enum, default_value = "unread")]
+    status: MessageStatus,
     /// Gmail search query. Ignored for generic IMAP accounts.
     #[arg(short, long)]
     query: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum MessageStatus {
+    /// Only unread messages.
+    Unread,
+    /// Only read messages.
+    Read,
+    /// Read and unread messages.
+    All,
+}
+
+impl MessageStatus {
+    fn gmail_query(self) -> Option<&'static str> {
+        match self {
+            Self::Unread => Some("is:unread"),
+            Self::Read => Some("is:read"),
+            Self::All => None,
+        }
+    }
+
+    fn imap_search(self) -> &'static str {
+        match self {
+            Self::Unread => "UNSEEN",
+            Self::Read => "SEEN",
+            Self::All => "ALL",
+        }
+    }
 }
 
 #[derive(Args, Debug)]
@@ -126,6 +161,9 @@ struct ReadArgs {
     /// Account email. Defaults to the active account.
     #[arg(long)]
     account: Option<String>,
+    /// Do not mark an unread message as read after displaying it.
+    #[arg(long)]
+    no_mark_read: bool,
 }
 
 #[derive(Args, Debug)]
@@ -142,6 +180,16 @@ struct SendArgs {
     /// Account email. Defaults to the active account.
     #[arg(long)]
     account: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct SyncArgs {
+    /// Account email. Defaults to the active account.
+    #[arg(long)]
+    account: Option<String>,
+    /// Maximum number of recent messages to sync.
+    #[arg(short, long, default_value_t = 50)]
+    limit: usize,
 }
 
 #[derive(Args, Debug)]
@@ -233,7 +281,34 @@ struct GmailMessageId {
 struct GmailMessage {
     id: String,
     snippet: Option<String>,
+    #[serde(rename = "labelIds", default)]
+    label_ids: Vec<String>,
     payload: Option<GmailPayload>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct SyncState {
+    #[serde(default)]
+    accounts: BTreeMap<String, Vec<MessageSnapshot>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct MessageSnapshot {
+    id: String,
+    unread: bool,
+    date: String,
+    from: String,
+    subject: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SyncChange {
+    New(MessageSnapshot),
+    StatusChanged {
+        before: MessageSnapshot,
+        after: MessageSnapshot,
+    },
+    Removed(MessageSnapshot),
 }
 
 #[derive(Debug, Deserialize)]
@@ -262,6 +337,7 @@ fn main() -> Result<()> {
         Command::List(args) => list_messages(args),
         Command::Read(args) => read_message(args),
         Command::Send(args) => send_message(args),
+        Command::Sync(args) => sync_messages(args),
         Command::Accounts => show_accounts(),
         Command::Use(arg) => use_account(arg),
     }
@@ -569,8 +645,8 @@ fn list_messages(args: ListArgs) -> Result<()> {
         .get_mut(&account_id)
         .context("account not found")?
     {
-        AccountConfig::Gmail(account) => list_gmail(account, args.limit, args.query),
-        AccountConfig::Generic(account) => list_generic(account, args.limit),
+        AccountConfig::Gmail(account) => list_gmail(account, args.limit, args.status, args.query),
+        AccountConfig::Generic(account) => list_generic(account, args.limit, args.status),
     }
 }
 
@@ -582,9 +658,31 @@ fn read_message(args: ReadArgs) -> Result<()> {
         .get_mut(&account_id)
         .context("account not found")?
     {
-        AccountConfig::Gmail(account) => read_gmail(account, &args.id),
-        AccountConfig::Generic(account) => read_generic(account, &args.id),
+        AccountConfig::Gmail(account) => read_gmail(account, &args.id, !args.no_mark_read),
+        AccountConfig::Generic(account) => read_generic(account, &args.id, !args.no_mark_read),
     }
+}
+
+fn sync_messages(args: SyncArgs) -> Result<()> {
+    let _lock = SyncLock::acquire()?;
+    let mut config = load_config()?;
+    let account_id = resolve_account(&config, args.account)?;
+    let snapshots = match config
+        .accounts
+        .get_mut(&account_id)
+        .context("account not found")?
+    {
+        AccountConfig::Gmail(account) => sync_gmail(account, args.limit)?,
+        AccountConfig::Generic(account) => sync_generic(account, args.limit)?,
+    };
+
+    let mut state = load_sync_state()?;
+    let previous = state.accounts.get(&account_id).cloned().unwrap_or_default();
+    let changes = sync_changes(&previous, &snapshots);
+    print_sync_changes(&changes);
+    state.accounts.insert(account_id, snapshots);
+    save_sync_state(&state)?;
+    Ok(())
 }
 
 fn send_message(args: SendArgs) -> Result<()> {
@@ -653,14 +751,19 @@ fn logout_account(arg: AccountArg) -> Result<()> {
     Ok(())
 }
 
-fn list_gmail(account: &mut GmailAccount, limit: usize, query: Option<String>) -> Result<()> {
+fn list_gmail(
+    account: &mut GmailAccount,
+    limit: usize,
+    status: MessageStatus,
+    query: Option<String>,
+) -> Result<()> {
     let token = gmail_access_token(account)?;
     let client = Client::new();
     let mut request = client
         .get(format!("{GMAIL_API_ROOT}/messages"))
         .bearer_auth(&token)
         .query(&[("maxResults", limit.min(100).to_string())]);
-    if let Some(query) = query {
+    if let Some(query) = gmail_list_query(status, query) {
         request = request.query(&[("q", query)]);
     }
 
@@ -690,7 +793,18 @@ fn list_gmail(account: &mut GmailAccount, limit: usize, query: Option<String>) -
     Ok(())
 }
 
-fn read_gmail(account: &mut GmailAccount, id: &str) -> Result<()> {
+fn gmail_list_query(status: MessageStatus, query: Option<String>) -> Option<String> {
+    match (status.gmail_query(), query) {
+        (Some(status_query), Some(query)) if !query.trim().is_empty() => {
+            Some(format!("{status_query} {}", query.trim()))
+        }
+        (Some(status_query), _) => Some(status_query.to_string()),
+        (None, Some(query)) if !query.trim().is_empty() => Some(query.trim().to_string()),
+        (None, _) => None,
+    }
+}
+
+fn read_gmail(account: &mut GmailAccount, id: &str, mark_read: bool) -> Result<()> {
     let token = gmail_access_token(account)?;
     let client = Client::new();
     let message = google_json::<GmailMessage>(
@@ -713,6 +827,22 @@ fn read_gmail(account: &mut GmailAccount, id: &str) -> Result<()> {
         let body = gmail_body(payload).unwrap_or_else(|| message.snippet.unwrap_or_default());
         println!("{}", body.trim());
     }
+    if mark_read && message.label_ids.iter().any(|label| label == "UNREAD") {
+        mark_gmail_read(&client, &token, id)?;
+    }
+    Ok(())
+}
+
+fn mark_gmail_read(client: &Client, token: &str, id: &str) -> Result<()> {
+    let _: serde_json::Value = google_json(
+        client
+            .post(format!("{GMAIL_API_ROOT}/messages/{id}/modify"))
+            .bearer_auth(token)
+            .json(&json!({ "removeLabelIds": ["UNREAD"] }))
+            .send()
+            .context("failed to mark Gmail message as read")?,
+        "Gmail mark-read request",
+    )?;
     Ok(())
 }
 
@@ -758,6 +888,44 @@ fn gmail_message_metadata(client: &Client, token: &str, id: &str) -> Result<Gmai
             .context("failed to read Gmail metadata")?,
         "Gmail metadata request",
     )
+}
+
+fn sync_gmail(account: &mut GmailAccount, limit: usize) -> Result<Vec<MessageSnapshot>> {
+    let token = gmail_access_token(account)?;
+    let client = Client::new();
+    let list = google_json::<GmailListResponse>(
+        client
+            .get(format!("{GMAIL_API_ROOT}/messages"))
+            .bearer_auth(&token)
+            .query(&[("maxResults", limit.min(100).to_string())])
+            .send()
+            .context("failed to sync Gmail messages")?,
+        "Gmail sync list request",
+    )?;
+
+    let Some(messages) = list.messages else {
+        return Ok(Vec::new());
+    };
+
+    messages
+        .into_iter()
+        .map(|item| {
+            let message = gmail_message_metadata(&client, &token, &item.id)?;
+            Ok(gmail_snapshot(message))
+        })
+        .collect()
+}
+
+fn gmail_snapshot(message: GmailMessage) -> MessageSnapshot {
+    let headers = gmail_headers(message.payload.as_ref());
+    MessageSnapshot {
+        id: message.id,
+        unread: message.label_ids.iter().any(|label| label == "UNREAD"),
+        date: header_value(&headers, "Date").unwrap_or_default(),
+        from: header_value(&headers, "From").unwrap_or_default(),
+        subject: header_value(&headers, "Subject")
+            .unwrap_or_else(|| message.snippet.unwrap_or_default()),
+    }
 }
 
 fn gmail_profile_email(client: &Client, token: &str) -> Result<String> {
@@ -970,11 +1138,11 @@ fn test_generic_login(account: &GenericAccount) -> Result<()> {
     Ok(())
 }
 
-fn list_generic(account: &GenericAccount, limit: usize) -> Result<()> {
+fn list_generic(account: &GenericAccount, limit: usize, status: MessageStatus) -> Result<()> {
     let mut session = generic_imap_session(account)?;
     session.select("INBOX").context("failed to select INBOX")?;
     let mut uids: Vec<u32> = session
-        .uid_search("ALL")
+        .uid_search(status.imap_search())
         .context("failed to search IMAP mailbox")?
         .into_iter()
         .collect();
@@ -1004,11 +1172,44 @@ fn list_generic(account: &GenericAccount, limit: usize) -> Result<()> {
     Ok(())
 }
 
-fn read_generic(account: &GenericAccount, uid: &str) -> Result<()> {
+fn sync_generic(account: &GenericAccount, limit: usize) -> Result<Vec<MessageSnapshot>> {
+    let mut session = generic_imap_session(account)?;
+    session.select("INBOX").context("failed to select INBOX")?;
+    let mut uids: Vec<u32> = session
+        .uid_search("ALL")
+        .context("failed to search IMAP mailbox")?
+        .into_iter()
+        .collect();
+    uids.sort_unstable();
+    uids.reverse();
+    uids.truncate(limit);
+
+    if uids.is_empty() {
+        session.logout().ok();
+        return Ok(Vec::new());
+    }
+
+    let uid_set = uids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let messages = session
+        .uid_fetch(uid_set, "FLAGS RFC822.HEADER")
+        .context("failed to fetch IMAP sync headers")?;
+    let mut snapshots = Vec::new();
+    for fetch in messages.iter() {
+        snapshots.push(imap_snapshot(fetch)?);
+    }
+    session.logout().ok();
+    Ok(snapshots)
+}
+
+fn read_generic(account: &GenericAccount, uid: &str, mark_read: bool) -> Result<()> {
     let mut session = generic_imap_session(account)?;
     session.select("INBOX").context("failed to select INBOX")?;
     let messages = session
-        .uid_fetch(uid, "RFC822")
+        .uid_fetch(uid, "FLAGS BODY.PEEK[]")
         .context("failed to fetch IMAP message")?;
     let fetch = messages
         .iter()
@@ -1024,6 +1225,11 @@ fn read_generic(account: &GenericAccount, uid: &str) -> Result<()> {
     print_header("Subject", parsed.headers.get_first_value("Subject"));
     println!();
     println!("{}", parsed_body(&parsed).trim());
+    if mark_read && !imap_fetch_is_read(fetch) {
+        session
+            .uid_store(uid, "+FLAGS.SILENT (\\Seen)")
+            .context("failed to mark IMAP message as read")?;
+    }
     session.logout().ok();
     Ok(())
 }
@@ -1087,6 +1293,104 @@ fn print_imap_summary(fetch: &Fetch) -> Result<()> {
     Ok(())
 }
 
+fn imap_snapshot(fetch: &Fetch) -> Result<MessageSnapshot> {
+    let uid = fetch.uid.context("IMAP response did not include UID")?;
+    let headers = fetch
+        .header()
+        .or_else(|| fetch.body())
+        .context("IMAP response did not include message headers")?;
+    let parsed = mailparse::parse_mail(headers).context("failed to parse IMAP headers")?;
+    Ok(MessageSnapshot {
+        id: uid.to_string(),
+        unread: !imap_fetch_is_read(fetch),
+        date: parsed.headers.get_first_value("Date").unwrap_or_default(),
+        from: parsed.headers.get_first_value("From").unwrap_or_default(),
+        subject: parsed
+            .headers
+            .get_first_value("Subject")
+            .unwrap_or_default(),
+    })
+}
+
+fn imap_fetch_is_read(fetch: &Fetch) -> bool {
+    fetch.flags().iter().any(|flag| matches!(flag, Flag::Seen))
+}
+
+fn sync_changes(previous: &[MessageSnapshot], current: &[MessageSnapshot]) -> Vec<SyncChange> {
+    let previous_by_id = previous
+        .iter()
+        .map(|message| (message.id.as_str(), message))
+        .collect::<BTreeMap<_, _>>();
+    let current_by_id = current
+        .iter()
+        .map(|message| (message.id.as_str(), message))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut changes = Vec::new();
+    for message in current {
+        match previous_by_id.get(message.id.as_str()) {
+            None => changes.push(SyncChange::New(message.clone())),
+            Some(before) if before.unread != message.unread => {
+                changes.push(SyncChange::StatusChanged {
+                    before: (*before).clone(),
+                    after: message.clone(),
+                });
+            }
+            _ => {}
+        }
+    }
+    for message in previous {
+        if !current_by_id.contains_key(message.id.as_str()) {
+            changes.push(SyncChange::Removed(message.clone()));
+        }
+    }
+    changes
+}
+
+fn print_sync_changes(changes: &[SyncChange]) {
+    if changes.is_empty() {
+        println!("No changes.");
+        return;
+    }
+
+    for change in changes {
+        match change {
+            SyncChange::New(message) => {
+                println!(
+                    "+ {} {}",
+                    message_status(message.unread),
+                    message_line(message)
+                );
+            }
+            SyncChange::StatusChanged { before, after } => {
+                println!(
+                    "~ {} -> {} {}",
+                    message_status(before.unread),
+                    message_status(after.unread),
+                    message_line(after)
+                );
+            }
+            SyncChange::Removed(message) => {
+                println!("- {}", message_line(message));
+            }
+        }
+    }
+}
+
+fn message_status(unread: bool) -> &'static str {
+    if unread { "unread" } else { "read" }
+}
+
+fn message_line(message: &MessageSnapshot) -> String {
+    format!(
+        "{}  {}  {}  {}",
+        message.id,
+        truncate(&message.date, 22),
+        truncate(&message.from, 35),
+        message.subject
+    )
+}
+
 fn parsed_body(mail: &mailparse::ParsedMail<'_>) -> String {
     if mail.subparts.is_empty() {
         return mail.get_body().unwrap_or_default();
@@ -1127,6 +1431,79 @@ fn save_config(config: &Config) -> Result<()> {
     Ok(())
 }
 
+fn load_sync_state() -> Result<SyncState> {
+    let path = sync_state_path()?;
+    if !path.exists() {
+        return Ok(SyncState::default());
+    }
+    let contents = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read sync state {}", path.display()))?;
+    serde_json::from_str(&contents)
+        .with_context(|| format!("failed to parse sync state {}", path.display()))
+}
+
+fn save_sync_state(state: &SyncState) -> Result<()> {
+    let path = sync_state_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create state dir {}", parent.display()))?;
+    }
+    let contents = serde_json::to_string_pretty(state)?;
+    write_private_file(&path, contents.as_bytes())?;
+    Ok(())
+}
+
+struct SyncLock {
+    path: PathBuf,
+}
+
+impl SyncLock {
+    fn acquire() -> Result<Self> {
+        let path = sync_lock_path()?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create state dir {}", parent.display()))?;
+        }
+        create_lock_file(&path, format!("pid={}\ntime={}\n", std::process::id(), now_ts()).as_bytes())
+            .with_context(|| {
+                format!(
+                    "sync is already running or a stale lock exists at {}; remove it if no email sync is running",
+                    path.display()
+                )
+            })?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for SyncLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(unix)]
+fn create_lock_file(path: &PathBuf, contents: &[u8]) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(contents)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn create_lock_file(path: &PathBuf, contents: &[u8]) -> Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(contents)?;
+    Ok(())
+}
+
 #[cfg(unix)]
 fn write_private_file(path: &PathBuf, contents: &[u8]) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
@@ -1150,6 +1527,21 @@ fn write_private_file(path: &PathBuf, contents: &[u8]) -> Result<()> {
 fn config_path() -> Result<PathBuf> {
     let base = dirs::config_dir().context("could not find user config directory")?;
     Ok(base.join(CONFIG_DIR).join(CONFIG_FILE))
+}
+
+fn sync_state_path() -> Result<PathBuf> {
+    Ok(state_dir_path()?.join(SYNC_STATE_FILE))
+}
+
+fn sync_lock_path() -> Result<PathBuf> {
+    Ok(state_dir_path()?.join(SYNC_LOCK_FILE))
+}
+
+fn state_dir_path() -> Result<PathBuf> {
+    let base = dirs::state_dir()
+        .or_else(dirs::data_local_dir)
+        .context("could not find user state directory")?;
+    Ok(base.join(CONFIG_DIR))
 }
 
 fn resolve_account(config: &Config, account: Option<String>) -> Result<String> {
@@ -1232,6 +1624,69 @@ mod tests {
     #[test]
     fn invalid_email_is_rejected() {
         assert!(provider_for_email("not-an-email").is_err());
+    }
+
+    #[test]
+    fn unread_status_is_default_gmail_query_prefix() {
+        assert_eq!(
+            gmail_list_query(MessageStatus::Unread, None),
+            Some("is:unread".to_string())
+        );
+        assert_eq!(
+            gmail_list_query(MessageStatus::Unread, Some("from:github".to_string())),
+            Some("is:unread from:github".to_string())
+        );
+    }
+
+    #[test]
+    fn read_and_all_statuses_map_to_provider_searches() {
+        assert_eq!(
+            gmail_list_query(MessageStatus::Read, Some("newer_than:7d".to_string())),
+            Some("is:read newer_than:7d".to_string())
+        );
+        assert_eq!(
+            gmail_list_query(MessageStatus::All, Some(" from:github ".to_string())),
+            Some("from:github".to_string())
+        );
+        assert_eq!(gmail_list_query(MessageStatus::All, None), None);
+        assert_eq!(MessageStatus::Unread.imap_search(), "UNSEEN");
+        assert_eq!(MessageStatus::Read.imap_search(), "SEEN");
+        assert_eq!(MessageStatus::All.imap_search(), "ALL");
+    }
+
+    #[test]
+    fn sync_changes_report_new_status_and_removed_messages() {
+        let old_unread = test_snapshot("1", true, "Old unread");
+        let removed = test_snapshot("2", false, "Removed");
+        let new_read = test_snapshot("3", false, "New read");
+        let now_read = test_snapshot("1", false, "Old unread");
+
+        let changes = sync_changes(
+            &[old_unread.clone(), removed.clone()],
+            &[now_read.clone(), new_read.clone()],
+        );
+
+        assert_eq!(
+            changes,
+            vec![
+                SyncChange::StatusChanged {
+                    before: old_unread,
+                    after: now_read,
+                },
+                SyncChange::New(new_read),
+                SyncChange::Removed(removed),
+            ]
+        );
+    }
+
+    fn test_snapshot(id: &str, unread: bool, subject: &str) -> MessageSnapshot {
+        MessageSnapshot {
+            id: id.to_string(),
+            unread,
+            date: "Thu, 11 Jun 2026 01:00:00 +0800".to_string(),
+            from: "sender@example.com".to_string(),
+            subject: subject.to_string(),
+        }
     }
 
     #[test]

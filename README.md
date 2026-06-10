@@ -43,6 +43,8 @@ cargo run -- --help
 ```sh
 email auth login "$EMAIL_ADDRESS"
 email list --limit 10
+email list --status all --limit 10
+email sync
 email read MESSAGE_ID_OR_UID
 email send --to "$TO_ADDRESS" --subject "Hello" --body "Sent from email"
 ```
@@ -125,9 +127,13 @@ email auth login "$EMAIL_ADDRESS" \
 | `email accounts` | List configured accounts |
 | `email auth whoami` | Print the active account |
 | `email use <email>` | Set the active account |
-| `email list --limit 10` | List recent messages |
-| `email list --query "from:github newer_than:7d"` | Search Gmail messages |
-| `email read <id-or-uid>` | Read a message |
+| `email list --limit 10` | List unread messages |
+| `email list --status read --limit 10` | List read messages |
+| `email list --status all --limit 10` | List read and unread messages |
+| `email list --query "from:github newer_than:7d"` | Search unread Gmail messages |
+| `email sync` | Sync recent message state and print changes |
+| `email read <id-or-uid>` | Read a message and mark it as read |
+| `email read --no-mark-read <id-or-uid>` | Read a message without changing read state |
 | `email send --to <email> --subject <subject> --body <text>` | Send a message |
 | `email auth logout <email>` | Remove an account |
 
@@ -143,6 +149,25 @@ Use a non-default account for a single command:
 email list --account "$EMAIL_ADDRESS"
 email send --account "$EMAIL_ADDRESS" --to "$TO_ADDRESS" --subject "Hi" --body "Hello"
 ```
+
+`email sync` stores a local snapshot of recent message ids and read state, then
+prints what changed since the previous sync:
+
+```text
++ unread MESSAGE_ID  DATE  FROM  SUBJECT
+~ unread -> read MESSAGE_ID  DATE  FROM  SUBJECT
+- MESSAGE_ID  DATE  FROM  SUBJECT
+```
+
+The sync state and lock file live in the standard user state directory:
+
+```text
+~/.local/state/emailctl/sync-state.json
+~/.local/state/emailctl/sync.lock
+```
+
+On non-Linux platforms, `email` uses the platform state/data directory returned
+by the operating system.
 
 ## Troubleshooting
 

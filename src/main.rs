@@ -21,7 +21,7 @@ use serde_json::json;
 use tiny_http::{Response, Server};
 use url::Url;
 
-const CONFIG_DIR: &str = "email-cli";
+const CONFIG_DIR: &str = "emailctl";
 const CONFIG_FILE: &str = "config.json";
 const GMAIL_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const GMAIL_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
@@ -1184,7 +1184,7 @@ fn truncate(value: &str, max_chars: usize) -> String {
 }
 
 fn oauth_state() -> String {
-    format!("email-cli-{}", now_ts())
+    format!("emailctl-{}", now_ts())
 }
 
 fn now_ts() -> i64 {

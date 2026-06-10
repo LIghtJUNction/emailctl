@@ -1,11 +1,12 @@
 [package]
-name = "email-cli-lightjunction"
-version = "0.1.0"
+name = "emailctl"
+version = "0.1.1"
 edition = "2024"
-authors = ["email-cli contributors"]
+rust-version = "1.85"
+authors = ["emailctl contributors"]
 description = "A small email CLI with Gmail OAuth first-class support and generic IMAP/SMTP accounts."
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/LIghtJUNction/email-cli"
+repository = "https://github.com/LIghtJUNction/emailctl"
 readme = "README.md"
 keywords = ["email", "gmail", "imap", "smtp", "cli"]
 categories = ["command-line-utilities", "email"]
